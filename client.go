@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Azure/azure-amqp-common-go/v3/uuid"
 )
 
 var (
@@ -700,6 +702,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 
 				// if this message is received unsettled and link rcv-settle-mode == second, add to handlesByRemoteDeliveryID
 				if !body.Settled && body.DeliveryID != nil && link.receiverSettleMode != nil && *link.receiverSettleMode == ModeSecond {
+					debug(1, "TX: adding handle to handlesByRemoteDeliveryID. linkCredit: %d", link.linkCredit)
 					handlesByRemoteDeliveryID[*body.DeliveryID] = body.Handle
 				}
 
@@ -763,7 +766,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				fr.done = nil
 			}
 
-			debug(2, "TX(Session): %s", fr)
+			debug(2, "TX(Session) - txtransfer: %s", fr)
 			s.txFrame(fr, fr.done)
 
 			// "Upon sending a transfer, the sending endpoint will increment
@@ -780,13 +783,13 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				fr.IncomingWindow = s.incomingWindow
 				fr.NextOutgoingID = nextOutgoingID
 				fr.OutgoingWindow = s.outgoingWindow
-				debug(1, "TX(Session): %s", fr)
+				debug(1, "TX(Session) - tx: %s", fr)
 				s.txFrame(fr, nil)
 				remoteOutgoingWindow = s.incomingWindow
 			case *performTransfer:
 				panic("transfer frames must use txTransfer")
 			default:
-				debug(1, "TX(Session): %s", fr)
+				debug(1, "TX(Session) - default: %s", fr)
 				s.txFrame(fr, nil)
 			}
 		}
@@ -1096,10 +1099,12 @@ Loop:
 		switch {
 		// enable outgoing transfers case if sender and credits are available
 		case isSender && l.linkCredit > 0:
+			debug(1, "Link Mux isSender: credit: %d, deliveryCount: %d, messages: %d, pending: %d", l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages))
 			outgoingTransfers = l.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
 		case isReceiver && l.linkCredit+uint32(len(l.pendingMessages)) <= (l.receiver.maxCredit)/2:
+			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages), l.receiver.maxCredit, l.receiverSettleMode.String())
 			l.err = l.muxFlow()
 			if l.err != nil {
 				return
@@ -1107,6 +1112,7 @@ Loop:
 			atomic.StoreUint32(&l.paused, 0)
 
 		case isReceiver && l.linkCredit == 0:
+			debug(1, "PAUSE Link Mux pause: inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages), l.receiver.maxCredit, l.receiverSettleMode.String())
 			atomic.StoreUint32(&l.paused, 1)
 		}
 
@@ -1130,6 +1136,8 @@ Loop:
 					if !tr.More {
 						l.deliveryCount++
 						l.linkCredit--
+						// we are the sender and we keep track of the peer's link credit
+						debug(3, "TX(link): key:%s, decremented linkCredit: %d", l.key, l.linkCredit)
 					}
 					continue Loop
 				case fr := <-l.rx:
@@ -1165,6 +1173,8 @@ func (l *link) muxFlow() error {
 		linkCredit    = l.receiver.maxCredit - uint32(len(l.pendingMessages))
 		deliveryCount = l.deliveryCount
 	)
+
+	debug(3, "link.muxFlow(): len(l.messages):%d - linkCredit: %d - deliveryCount: %d, inFlight: %d", len(l.messages), l.linkCredit, deliveryCount, len(l.receiver.inFlight.m))
 
 	fr := &performFlow{
 		Handle:        &l.handle,
@@ -1314,11 +1324,14 @@ func (l *link) muxReceive(fr performTransfer) error {
 	if err != nil {
 		return err
 	}
-
+	uuid, _ := uuidFromLockTokenBytes(l.msg.DeliveryTag)
+	debug(1, "%s before push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", uuid, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 	// send to receiver, this should never block due to buffering
 	// and flow control.
 	l.addPending(&l.msg)
 	l.messages <- l.msg
+
+	debug(1, "%s after push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", uuid, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 
 	// reset progress
 	l.buf.reset()
@@ -1327,8 +1340,32 @@ func (l *link) muxReceive(fr performTransfer) error {
 	// decrement link-credit after entire message received
 	l.deliveryCount++
 	l.linkCredit--
-
+	debug(1, "%s before exit - deliveryCount : %d - linkCredit: %d, len(messages): %d", uuid, l.deliveryCount, l.linkCredit, len(l.messages))
 	return nil
+}
+
+func uuidFromLockTokenBytes(bytes []byte) (*uuid.UUID, error) {
+	if len(bytes) != 16 {
+		return nil, fmt.Errorf("invalid lock token, token was not 16 bytes long")
+	}
+
+	var swapIndex = func(indexOne, indexTwo int, array *[16]byte) {
+		v1 := array[indexOne]
+		array[indexOne] = array[indexTwo]
+		array[indexTwo] = v1
+	}
+
+	// Get lock token from the deliveryTag
+	var lockTokenBytes [16]byte
+	copy(lockTokenBytes[:], bytes[:16])
+	// translate from .net guid byte serialisation format to amqp rfc standard
+	swapIndex(0, 3, &lockTokenBytes)
+	swapIndex(1, 2, &lockTokenBytes)
+	swapIndex(4, 5, &lockTokenBytes)
+	swapIndex(6, 7, &lockTokenBytes)
+	amqpUUID := uuid.UUID(lockTokenBytes)
+
+	return &amqpUUID, nil
 }
 
 // muxHandleFrame processes fr based on type.
@@ -1930,7 +1967,7 @@ func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) erro
 		if atomic.LoadUint32(&r.link.paused) == 1 {
 			select {
 			case r.link.receiverReady <- struct{}{}:
-				debug(3, "Receive() resume link on completion")
+				debug(3, "Receive() unpause link on completion")
 			default:
 			}
 		}
