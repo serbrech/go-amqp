@@ -1103,7 +1103,7 @@ Loop:
 			outgoingTransfers = l.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
-		case isReceiver && l.linkCredit+uint32(len(l.pendingMessages)) <= (l.receiver.maxCredit)/2:
+		case isReceiver && l.linkCredit+uint32(len(l.pendingMessages)) <= l.receiver.maxCredit/2:
 			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages), l.receiver.maxCredit, l.receiverSettleMode.String())
 			l.err = l.muxFlow()
 			if l.err != nil {
