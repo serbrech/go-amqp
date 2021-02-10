@@ -866,12 +866,14 @@ type link struct {
 	err                error // err returned on Close()
 
 	// message receiving
-	paused        uint32        // atomically accessed; indicates that all link credits have been used by sender
-	receiverReady chan struct{} // receiver sends on this when mux is paused to indicate it can handle more messages
-	messages      chan Message  // used to send completed messages to receiver
-	buf           buffer        // buffered bytes for current message
-	more          bool          // if true, buf contains a partial message
-	msg           Message       // current message being decoded
+	paused              uint32              // atomically accessed; indicates that all link credits have been used by sender
+	receiverReady       chan struct{}       // receiver sends on this when mux is paused to indicate it can handle more messages
+	messages            chan Message        // used to send completed messages to receiver
+	pendingMessages     map[uint32]struct{} // used to keep track of messages being handled downstream
+	pendingMessagesLock sync.RWMutex        // lock to protect concurrent access to pendingMessages
+	buf                 buffer              // buffered bytes for current message
+	more                bool                // if true, buf contains a partial message
+	msg                 Message             // current message being decoded
 }
 
 // attachLink is used by Receiver and Sender to create new links
@@ -1001,6 +1003,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		l.deliveryCount = resp.InitialDeliveryCount
 		// buffer receiver so that link.mux doesn't block
 		l.messages = make(chan Message, l.receiver.maxCredit)
+		l.pendingMessages = map[uint32]struct{}{}
 	} else {
 		// if dynamic address requested, copy assigned name to address
 		if l.dynamicAddr && resp.Target != nil {
@@ -1018,6 +1021,18 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	go l.mux()
 
 	return l, nil
+}
+
+func (l *link) addPending(msg *Message) {
+	l.pendingMessagesLock.Lock()
+	l.pendingMessages[msg.deliveryID] = struct{}{}
+	l.pendingMessagesLock.Unlock()
+}
+
+func (l *link) deletePending(msg *Message) {
+	l.pendingMessagesLock.Lock()
+	delete(l.pendingMessages, msg.deliveryID)
+	l.pendingMessagesLock.Unlock()
 }
 
 // setSettleModes sets the settlement modes based on the resp performAttach.
@@ -1084,7 +1099,7 @@ Loop:
 			outgoingTransfers = l.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
-		case isReceiver && l.linkCredit+uint32(len(l.messages)) <= l.receiver.maxCredit/2:
+		case isReceiver && l.linkCredit+uint32(len(l.pendingMessages)) <= (l.receiver.maxCredit)/2:
 			l.err = l.muxFlow()
 			if l.err != nil {
 				return
@@ -1147,7 +1162,7 @@ Loop:
 func (l *link) muxFlow() error {
 	// copy because sent by pointer below; prevent race
 	var (
-		linkCredit    = l.receiver.maxCredit - uint32(len(l.messages))
+		linkCredit    = l.receiver.maxCredit - uint32(len(l.pendingMessages))
 		deliveryCount = l.deliveryCount
 	)
 
@@ -1264,7 +1279,9 @@ func (l *link) muxReceive(fr performTransfer) error {
 	// discard message if it's been aborted
 	if fr.Aborted {
 		l.buf.reset()
-		l.msg = Message{}
+		l.msg = Message{
+			doneSignal: make(chan struct{}),
+		}
 		l.more = false
 		return nil
 	}
@@ -1300,6 +1317,7 @@ func (l *link) muxReceive(fr performTransfer) error {
 
 	// send to receiver, this should never block due to buffering
 	// and flow control.
+	l.addPending(&l.msg)
 	l.messages <- l.msg
 
 	// reset progress
@@ -1897,6 +1915,61 @@ type Receiver struct {
 	inFlight     inFlight                // used to track message disposition when rcv-settle-mode == second
 }
 
+// HandleMessage takes in a func to handle the incoming message.
+// Blocks until a message is received, ctx completes, or an error occurs.
+
+// Note: You must take an action on the message in the provided handler (Accept/Reject/Release/Modify)
+// or the pending message tracker will get out of sync, and reduce the flow.
+func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) error) error {
+	debug(3, "Entering link %s Receive()", r.link.key.name)
+
+	trackCompletion := func(msg *Message) {
+		<-msg.doneSignal
+		r.link.deletePending(msg)
+		debug(3, "Receive() deleted pending %d", msg.deliveryID)
+		if atomic.LoadUint32(&r.link.paused) == 1 {
+			select {
+			case r.link.receiverReady <- struct{}{}:
+				debug(3, "Receive() resume link on completion")
+			default:
+			}
+		}
+	}
+	callHandler := func(msg *Message) error {
+		debug(3, "Receive() blocking %d", msg.deliveryID)
+		msg.receiver = r
+		if msg.doneSignal == nil {
+			msg.doneSignal = make(chan struct{})
+		}
+		go trackCompletion(msg)
+		// tracks messages until exiting handler
+		if err := handle(msg); err != nil {
+			debug(3, "Receive() blocking %d - error: %s", msg.deliveryID, err.Error())
+			return err
+		}
+		return nil
+	}
+
+	select {
+	case msg := <-r.link.messages:
+		return callHandler(&msg)
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// pass through, to buffer msgs when the handler is busy
+	}
+
+	select {
+	case msg := <-r.link.messages:
+		return callHandler(&msg)
+	case <-r.link.done:
+		return r.link.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Deprecated: prefer HandleMessage
 // Receive returns the next message from the sender.
 //
 // Blocks until a message is received, ctx completes, or an error occurs.
@@ -1912,6 +1985,11 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// delivered regardless of whether the link has been closed.
 	select {
 	case msg := <-r.link.messages:
+		// we remove the message from pending as soon as it's popped off the channel
+		// This makes the pending count the same as messages buffer count
+		// and keeps the behavior the same as before the pending messages tracking was introduced
+		defer r.link.deletePending(&msg)
+		debug(3, "Receive() non blocking %d", msg.deliveryID)
 		msg.receiver = r
 		return &msg, nil
 	case <-ctx.Done():
@@ -1922,6 +2000,11 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// wait for the next message
 	select {
 	case msg := <-r.link.messages:
+		// we remove the message from pending as soon as it's popped off the channel
+		// This makes the pending count the same as messages buffer count
+		// and keeps the behavior the same as before the pending messages tracking was introduced
+		defer r.link.deletePending(&msg)
+		debug(3, "Receive() blocking %d", msg.deliveryID)
 		msg.receiver = r
 		return &msg, nil
 	case <-r.link.done:
@@ -2054,6 +2137,7 @@ func (r *Receiver) sendDisposition(first uint32, last *uint32, state interface{}
 func (r *Receiver) messageDisposition(ctx context.Context, id uint32, state interface{}) error {
 	var wait chan error
 	if r.link.receiverSettleMode != nil && *r.link.receiverSettleMode == ModeSecond {
+		debug(3, "RX: add %s to inflight", id)
 		wait = r.inFlight.add(id)
 	}
 
