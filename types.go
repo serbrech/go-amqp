@@ -1851,6 +1851,13 @@ func (m *Message) Modify(ctx context.Context, deliveryFailed, undeliverableHere 
 		})
 }
 
+// Ignore notifies the amqp message pump that the message has been handled
+// without any disposition. It frees the amqp receiver to get the next message
+// this is implicitly done after calling message dispositions (Accept/Release/Reject/Modify)
+func (m *Message) Ignore() {
+	m.done()
+}
+
 // MarshalBinary encodes the message into binary form.
 func (m *Message) MarshalBinary() ([]byte, error) {
 	buf := new(buffer)
