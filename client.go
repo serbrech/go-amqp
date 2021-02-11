@@ -1034,9 +1034,15 @@ func (l *link) addPending(msg *Message) {
 
 func (l *link) deletePending(msg *Message) {
 	l.pendingMessagesLock.Lock()
-	fmt.Println("deleted pending")
 	delete(l.pendingMessages, msg.deliveryID)
 	l.pendingMessagesLock.Unlock()
+}
+
+func (l *link) countPending() int {
+	l.pendingMessagesLock.RLock()
+	count := len(l.pendingMessages)
+	l.pendingMessagesLock.RUnlock()
+	return count
 }
 
 // setSettleModes sets the settlement modes based on the resp performAttach.
@@ -1100,12 +1106,12 @@ Loop:
 		switch {
 		// enable outgoing transfers case if sender and credits are available
 		case isSender && l.linkCredit > 0:
-			debug(1, "Link Mux isSender: credit: %d, deliveryCount: %d, messages: %d, pending: %d", l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages))
+			debug(1, "Link Mux isSender: credit: %d, deliveryCount: %d, messages: %d, pending: %d", l.linkCredit, l.deliveryCount, len(l.messages), l.countPending())
 			outgoingTransfers = l.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
-		case isReceiver && l.linkCredit+uint32(len(l.pendingMessages)) <= l.receiver.maxCredit/2:
-			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages), l.receiver.maxCredit, l.receiverSettleMode.String())
+		case isReceiver && l.linkCredit+uint32(l.countPending()) <= l.receiver.maxCredit/2:
+			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countPending(), l.receiver.maxCredit, l.receiverSettleMode.String())
 			l.err = l.muxFlow()
 			if l.err != nil {
 				return
@@ -1113,7 +1119,7 @@ Loop:
 			atomic.StoreUint32(&l.paused, 0)
 
 		case isReceiver && l.linkCredit == 0:
-			debug(1, "PAUSE Link Mux pause: inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), len(l.pendingMessages), l.receiver.maxCredit, l.receiverSettleMode.String())
+			debug(1, "PAUSE Link Mux pause: inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countPending(), l.receiver.maxCredit, l.receiverSettleMode.String())
 			atomic.StoreUint32(&l.paused, 1)
 		}
 
@@ -1171,7 +1177,7 @@ Loop:
 func (l *link) muxFlow() error {
 	// copy because sent by pointer below; prevent race
 	var (
-		linkCredit    = l.receiver.maxCredit - uint32(len(l.pendingMessages))
+		linkCredit    = l.receiver.maxCredit - uint32(l.countPending())
 		deliveryCount = l.deliveryCount
 	)
 
