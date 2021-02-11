@@ -1034,6 +1034,7 @@ func (l *link) addPending(msg *Message) {
 
 func (l *link) deletePending(msg *Message) {
 	l.pendingMessagesLock.Lock()
+	fmt.Println("deleted pending")
 	delete(l.pendingMessages, msg.deliveryID)
 	l.pendingMessagesLock.Unlock()
 }
@@ -1137,7 +1138,7 @@ Loop:
 						l.deliveryCount++
 						l.linkCredit--
 						// we are the sender and we keep track of the peer's link credit
-						debug(3, "TX(link): key:%s, decremented linkCredit: %d", l.key, l.linkCredit)
+						debug(3, "TX(link): key:%s, decremented linkCredit: %d", l.key.name, l.linkCredit)
 					}
 					continue Loop
 				case fr := <-l.rx:
@@ -2174,7 +2175,7 @@ func (r *Receiver) sendDisposition(first uint32, last *uint32, state interface{}
 func (r *Receiver) messageDisposition(ctx context.Context, id uint32, state interface{}) error {
 	var wait chan error
 	if r.link.receiverSettleMode != nil && *r.link.receiverSettleMode == ModeSecond {
-		debug(3, "RX: add %s to inflight", id)
+		debug(3, "RX: add %d to inflight", id)
 		wait = r.inFlight.add(id)
 	}
 
