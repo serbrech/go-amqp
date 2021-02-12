@@ -867,14 +867,14 @@ type link struct {
 	err                error // err returned on Close()
 
 	// message receiving
-	paused              uint32              // atomically accessed; indicates that all link credits have been used by sender
-	receiverReady       chan struct{}       // receiver sends on this when mux is paused to indicate it can handle more messages
-	messages            chan Message        // used to send completed messages to receiver
-	pendingMessages     map[uint32]struct{} // used to keep track of messages being handled downstream
-	pendingMessagesLock sync.RWMutex        // lock to protect concurrent access to pendingMessages
-	buf                 buffer              // buffered bytes for current message
-	more                bool                // if true, buf contains a partial message
-	msg                 Message             // current message being decoded
+	paused                uint32              // atomically accessed; indicates that all link credits have been used by sender
+	receiverReady         chan struct{}       // receiver sends on this when mux is paused to indicate it can handle more messages
+	messages              chan Message        // used to send completed messages to receiver
+	unsettledMessages     map[uint32]struct{} // used to keep track of messages being handled downstream
+	unsettledMessagesLock sync.RWMutex        // lock to protect concurrent access to unsettledMessages
+	buf                   buffer              // buffered bytes for current message
+	more                  bool                // if true, buf contains a partial message
+	msg                   Message             // current message being decoded
 }
 
 // attachLink is used by Receiver and Sender to create new links
@@ -1004,7 +1004,7 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		l.deliveryCount = resp.InitialDeliveryCount
 		// buffer receiver so that link.mux doesn't block
 		l.messages = make(chan Message, l.receiver.maxCredit)
-		l.pendingMessages = map[uint32]struct{}{}
+		l.unsettledMessages = map[uint32]struct{}{}
 	} else {
 		// if dynamic address requested, copy assigned name to address
 		if l.dynamicAddr && resp.Target != nil {
@@ -1024,22 +1024,22 @@ func attachLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 	return l, nil
 }
 
-func (l *link) addPending(msg *Message) {
-	l.pendingMessagesLock.Lock()
-	l.pendingMessages[msg.deliveryID] = struct{}{}
-	l.pendingMessagesLock.Unlock()
+func (l *link) addUnsettled(msg *Message) {
+	l.unsettledMessagesLock.Lock()
+	l.unsettledMessages[msg.deliveryID] = struct{}{}
+	l.unsettledMessagesLock.Unlock()
 }
 
-func (l *link) deletePending(msg *Message) {
-	l.pendingMessagesLock.Lock()
-	delete(l.pendingMessages, msg.deliveryID)
-	l.pendingMessagesLock.Unlock()
+func (l *link) deleteUnsettled(msg *Message) {
+	l.unsettledMessagesLock.Lock()
+	delete(l.unsettledMessages, msg.deliveryID)
+	l.unsettledMessagesLock.Unlock()
 }
 
-func (l *link) countPending() int {
-	l.pendingMessagesLock.RLock()
-	count := len(l.pendingMessages)
-	l.pendingMessagesLock.RUnlock()
+func (l *link) countUnsettled() int {
+	l.unsettledMessagesLock.RLock()
+	count := len(l.unsettledMessages)
+	l.unsettledMessagesLock.RUnlock()
 	return count
 }
 
@@ -1104,12 +1104,12 @@ Loop:
 		switch {
 		// enable outgoing transfers case if sender and credits are available
 		case isSender && l.linkCredit > 0:
-			debug(1, "Link Mux isSender: credit: %d, deliveryCount: %d, messages: %d, pending: %d", l.linkCredit, l.deliveryCount, len(l.messages), l.countPending())
+			debug(1, "Link Mux isSender: credit: %d, deliveryCount: %d, messages: %d, unsettled: %d", l.linkCredit, l.deliveryCount, len(l.messages), l.countUnsettled())
 			outgoingTransfers = l.transfers
 
 		// if receiver && half maxCredits have been processed, send more credits
-		case isReceiver && l.linkCredit+uint32(l.countPending()) <= l.receiver.maxCredit/2:
-			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countPending(), l.receiver.maxCredit, l.receiverSettleMode.String())
+		case isReceiver && l.linkCredit+uint32(l.countUnsettled()) <= l.receiver.maxCredit/2:
+			debug(1, "FLOW Link Mux half: source: %s, inflight: %d, credit: %d, deliveryCount: %d, messages: %d, unsettled: %d, maxCredit : %d, settleMode: %s", l.source.Address, len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countUnsettled(), l.receiver.maxCredit, l.receiverSettleMode.String())
 			l.err = l.muxFlow()
 			if l.err != nil {
 				return
@@ -1117,7 +1117,7 @@ Loop:
 			atomic.StoreUint32(&l.paused, 0)
 
 		case isReceiver && l.linkCredit == 0:
-			debug(1, "PAUSE Link Mux pause: inflight: %d, credit: %d, deliveryCount: %d, messages: %d, pending: %d, maxCredit : %d, settleMode: %s", len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countPending(), l.receiver.maxCredit, l.receiverSettleMode.String())
+			debug(1, "PAUSE Link Mux pause: inflight: %d, credit: %d, deliveryCount: %d, messages: %d, unsettled: %d, maxCredit : %d, settleMode: %s", len(l.receiver.inFlight.m), l.linkCredit, l.deliveryCount, len(l.messages), l.countUnsettled(), l.receiver.maxCredit, l.receiverSettleMode.String())
 			atomic.StoreUint32(&l.paused, 1)
 		}
 
@@ -1175,7 +1175,7 @@ Loop:
 func (l *link) muxFlow() error {
 	// copy because sent by pointer below; prevent race
 	var (
-		linkCredit    = l.receiver.maxCredit - uint32(l.countPending())
+		linkCredit    = l.receiver.maxCredit - uint32(l.countUnsettled())
 		deliveryCount = l.deliveryCount
 	)
 
@@ -1332,7 +1332,7 @@ func (l *link) muxReceive(fr performTransfer) error {
 	debug(1, "deliveryID %d before push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 	// send to receiver, this should never block due to buffering
 	// and flow control.
-	l.addPending(&l.msg)
+	l.addUnsettled(&l.msg)
 	l.messages <- l.msg
 
 	debug(1, "deliveryID %d after push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
@@ -1936,14 +1936,14 @@ type Receiver struct {
 // Blocks until a message is received, ctx completes, or an error occurs.
 
 // Note: You must take an action on the message in the provided handler (Accept/Reject/Release/Modify)
-// or the pending message tracker will get out of sync, and reduce the flow.
+// or the unsettled message tracker will get out of sync, and reduce the flow.
 func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) error) error {
 	debug(3, "Entering link %s Receive()", r.link.key.name)
 
 	trackCompletion := func(msg *Message) {
 		<-msg.doneSignal
-		r.link.deletePending(msg)
-		debug(3, "Receive() deleted pending %d", msg.deliveryID)
+		r.link.deleteUnsettled(msg)
+		debug(3, "Receive() deleted unsettled %d", msg.deliveryID)
 		if atomic.LoadUint32(&r.link.paused) == 1 {
 			select {
 			case r.link.receiverReady <- struct{}{}:
@@ -2002,10 +2002,10 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// delivered regardless of whether the link has been closed.
 	select {
 	case msg := <-r.link.messages:
-		// we remove the message from pending as soon as it's popped off the channel
-		// This makes the pending count the same as messages buffer count
-		// and keeps the behavior the same as before the pending messages tracking was introduced
-		defer r.link.deletePending(&msg)
+		// we remove the message from unsettled map as soon as it's popped off the channel
+		// This makes the unsettled count the same as messages buffer count
+		// and keeps the behavior the same as before the unsettled messages tracking was introduced
+		defer r.link.deleteUnsettled(&msg)
 		debug(3, "Receive() non blocking %d", msg.deliveryID)
 		msg.receiver = r
 		return &msg, nil
@@ -2017,10 +2017,10 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 	// wait for the next message
 	select {
 	case msg := <-r.link.messages:
-		// we remove the message from pending as soon as it's popped off the channel
-		// This makes the pending count the same as messages buffer count
-		// and keeps the behavior the same as before the pending messages tracking was introduced
-		defer r.link.deletePending(&msg)
+		// we remove the message from unsettled map as soon as it's popped off the channel
+		// This makes the unsettled count the same as messages buffer count
+		// and keeps the behavior the same as before the unsettled messages tracking was introduced
+		defer r.link.deleteUnsettled(&msg)
 		debug(3, "Receive() blocking %d", msg.deliveryID)
 		msg.receiver = r
 		return &msg, nil
