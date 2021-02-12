@@ -1116,7 +1116,6 @@ func createEventHubReceivers(t testing.TB, hubName string, session *amqp.Session
 	}
 }*/
 
-
 func TestIntegration_PeekLockExpiry_ReturnsErrorOnAcceptFailures(t *testing.T) {
 	queueName, _, cleanup := newTestQueue(t, "receive", func(prop *servicebus.SBQueueProperties) {
 		lockDuration := "PT5S"
@@ -1427,7 +1426,6 @@ func TestIntegration_PeekLockExpiryOnBufferedMessages_ShouldPassWithHandleMessag
 		})
 	}
 }
-
 
 func TestIssue48_ReceiverModeSecond(t *testing.T) {
 	azDescription := regexp.MustCompile(`The format code '0x68' at frame buffer offset '\d+' is invalid or unexpected`)

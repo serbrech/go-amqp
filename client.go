@@ -15,8 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/Azure/azure-amqp-common-go/v3/uuid"
 )
 
 var (
@@ -1331,14 +1329,13 @@ func (l *link) muxReceive(fr performTransfer) error {
 	if err != nil {
 		return err
 	}
-	uuid, _ := uuidFromLockTokenBytes(l.msg.DeliveryTag)
-	debug(1, "%s before push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", uuid, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
+	debug(1, "deliveryID %d before push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 	// send to receiver, this should never block due to buffering
 	// and flow control.
 	l.addPending(&l.msg)
 	l.messages <- l.msg
 
-	debug(1, "%s after push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", uuid, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
+	debug(1, "deliveryID %d after push to receiver - deliveryCount : %d - linkCredit: %d, len(messages): %d, len(inflight): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages), len(l.receiver.inFlight.m))
 
 	// reset progress
 	l.buf.reset()
@@ -1347,32 +1344,8 @@ func (l *link) muxReceive(fr performTransfer) error {
 	// decrement link-credit after entire message received
 	l.deliveryCount++
 	l.linkCredit--
-	debug(1, "%s before exit - deliveryCount : %d - linkCredit: %d, len(messages): %d", uuid, l.deliveryCount, l.linkCredit, len(l.messages))
+	debug(1, "deliveryID %d before exit - deliveryCount : %d - linkCredit: %d, len(messages): %d", l.msg.deliveryID, l.deliveryCount, l.linkCredit, len(l.messages))
 	return nil
-}
-
-func uuidFromLockTokenBytes(bytes []byte) (*uuid.UUID, error) {
-	if len(bytes) != 16 {
-		return nil, fmt.Errorf("invalid lock token, token was not 16 bytes long")
-	}
-
-	var swapIndex = func(indexOne, indexTwo int, array *[16]byte) {
-		v1 := array[indexOne]
-		array[indexOne] = array[indexTwo]
-		array[indexTwo] = v1
-	}
-
-	// Get lock token from the deliveryTag
-	var lockTokenBytes [16]byte
-	copy(lockTokenBytes[:], bytes[:16])
-	// translate from .net guid byte serialisation format to amqp rfc standard
-	swapIndex(0, 3, &lockTokenBytes)
-	swapIndex(1, 2, &lockTokenBytes)
-	swapIndex(4, 5, &lockTokenBytes)
-	swapIndex(6, 7, &lockTokenBytes)
-	amqpUUID := uuid.UUID(lockTokenBytes)
-
-	return &amqpUUID, nil
 }
 
 // muxHandleFrame processes fr based on type.
