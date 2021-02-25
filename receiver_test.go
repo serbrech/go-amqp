@@ -110,9 +110,11 @@ func TestReceiver_HandleMessageModeSecond_removeFromUnsettledMapOnDisposition(t 
 	// simulate batch disposition.
 	// when the inflight has an entry, we know the Accept has been called
 	for loop {
+		r.inFlight.mu.Lock()
 		inflightCount := len(r.inFlight.m)
-		r.inFlight.remove(msg.deliveryID, nil, nil)
+		r.inFlight.mu.Unlock()
 		if inflightCount > 0 {
+			r.inFlight.remove(msg.deliveryID, nil, nil)
 			loop = false
 		}
 		time.Sleep(1 * time.Millisecond)
