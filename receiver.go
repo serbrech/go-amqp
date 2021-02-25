@@ -49,6 +49,11 @@ func (r *Receiver) HandleMessage(ctx context.Context, handle func(*Message) erro
 			msg.doneSignal = make(chan struct{})
 		}
 		go trackCompletion(msg)
+		// accept spontaneously when receiver is in ModeFirst
+		// spec : http://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#type-receiver-settle-mode
+		if r.link.receiverSettleMode != nil && *r.link.receiverSettleMode == ModeFirst {
+			msg.Accept(ctx)
+		}
 		// tracks messages until exiting handler
 		if err := handle(msg); err != nil {
 			debug(3, "Receive() blocking %d - error: %s", msg.deliveryID, err.Error())
